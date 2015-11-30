@@ -49,6 +49,13 @@ after user activity ceases. This parameter only has an effect if the
 `autoRotate` parameter is set.
 
 
+### `autoRotateStopDelay`
+
+Sets the delay, in milliseconds, to stop automatically rotating the panorama
+after it is loaded. This parameter only has an effect if the `autoRotate`
+parameter is set.
+
+
 ### `fallback`
 
 If set, the value is used as a URL for a fallback viewer in case Pannellum is
@@ -66,6 +73,11 @@ CSS.
 ### `showZoomCtrl`
 
 If set to `false`, the zoom controls will not be displayed. Defaults to `true`.
+
+
+### `keyboardZoom`
+
+If set to `false`, zooming with keyboard will be disabled. Defaults to `true`.
 
 
 ### `showFullscreenCtrl`
@@ -120,6 +132,11 @@ Set the offset, in degrees, of the center of the panorama from North. As this
 affects the compass, it only has an effect if `compass` is set to `true`.
 
 
+### `preview`
+
+Specifies a URL for a preview image to display before the panorama is loaded.
+
+
 ### `hotSpots`
 
 This specifies an array of hot spots that can be links to other scenes,
@@ -157,6 +174,25 @@ Not applicable for `scene` hot spots.
 Specifies the ID of the scene to link to for `scene` hot spots. Not applicable
 for `info` hot spots.
 
+#### `targetPitch`
+
+Specifies the pitch of the target scene.
+
+#### `targetYaw`
+
+Specifies the yaw of the target scene.
+
+### `hotSpotDebug`
+
+When `true`, the mouse pointer's pitch and yaw are logged to the console when
+the mouse button is clicked. Defaults to `false`.
+
+### `sceneFadeDuration`
+
+Specifies the fade duration, in milliseconds, when transitioning between
+scenes. Not defined by default. Only applicable for tours. Only works with
+WebGL renderer.
+
 
 
 ## `equirectangular` specific options
@@ -185,8 +221,8 @@ vertical.
 ### `vOffset`
 
 Sets the vertical offset of the center of the equirectangular image from the
-horizon, in degrees. Defaults to `0`. This is used if `vaov` is not zero and
-the equirectangular image is not cropped symmetrically.
+horizon, in degrees. Defaults to `0`. This is used if `vaov` is less than `180`
+and the equirectangular image is not cropped symmetrically.
 
 ### `ignoreGPanoXMP`
 
@@ -258,24 +294,14 @@ tiles were created from.
 
 
 
-## Video specific options
+## Dynamic content specific options
 
-Currently, only equirectangular videos are supported.
+Currently, only equirectangular dynamic content is supported.
 
-### `video`
+### `dynamic`
 
-The panorama is considered a video when this is set to `true`. Defaults to
-`false`.
-
-### `panoramas`
-
-This parameter's value contains an array of objects designating the
-equirectangular video in various formats. Each object has a `file` property
-that contains the video's URL and a `type` property that contains the video's
-MIME type. Pannellum attempts to use video files in the order they are
-specified, so preferred formats should be placed first. An error is displayed
-if the user's browser does not support any of the specified formats. This
-parameter only has an effect is `video` is set to `true`.
+The panorama source is considered dynamic when this is set to `true`. Defaults
+to `false`. This should be set to `true` for video.
 
 
 

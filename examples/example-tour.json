@@ -1,13 +1,13 @@
 ﻿{
     "default": {
         "author": "Matthew Petroff",
-        "firstScene": "pond"
+        "firstScene": "pond",
+        "sceneFadeDuration": 2000
     },
     
     "scenes": {
         "pondCube": {
             "title": "Jordan Pond (Cube)",
-            "preview": "./examplepano-preview.jpg",
             "type": "cubemap",
             "cubeMap": [
                 "./examplepanocube0.jpg",
@@ -20,20 +20,20 @@
             "hotSpots": [
                 {
                     "pitch": -12,
-                    "yaw": -170,
+                    "yaw": 170,
                     "type": "info",
                     "text": "This is Jordan Pond, located in Acadia National Park."
                 },
                 {
                     "pitch": -10,
-                    "yaw": 50,
+                    "yaw": -50,
                     "type": "info",
                     "text": "This is a link.",
                     "URL": "https://github.com/mpetroff/pannellum"
                 },
                 {
                     "pitch": 0,
-                    "yaw": 60,
+                    "yaw": -60,
                     "type": "scene",
                     "text": "Pond",
                     "sceneId": "pond"
@@ -43,12 +43,11 @@
 
         "pond": {
             "title": "Jordan Pond",
-            "preview": "./examplepano-preview.jpg",
             "panorama": "./examplepano.jpg",
             "hotSpots": [
                 {
                     "pitch": 0,
-                    "yaw": -100,
+                    "yaw": 100,
                     "type": "scene",
                     "text": "Pond (cube)",
                     "sceneId": "pondCube"

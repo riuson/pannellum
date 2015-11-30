@@ -1,6 +1,6 @@
 /*
  * libpannellum - A WebGL and CSS 3D transform based Panorama Renderer
- * Copyright (c) 2012-2014 Matthew Petroff
+ * Copyright (c) 2012-2015 Matthew Petroff
  * 
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -25,45 +25,160 @@ window.libpannellum = (function(window, document, undefined) {
 
 'use strict';
 
-/* Image Type argument can be that of "equirectangular" or "cubemap".
- * If "cubemap" is used, the image argument should be an array of images
- * instead of a single image.  They should be the order of:
- * +z, +x, -z, -x, +y, -y.
+/**
+ * Creates a new panorama renderer.
+ * @constructor
+ * @param {HTMLElement} container - The container element for the renderer.
+ * @param {Image|Array|Object} image - Input image; format varies based on
+ *      `imageType`. For `equirectangular`, this is an image; for `cubemap`,
+ *      this is an array of images for the cube faces in the order [+z, +x, -z,
+ *      -x, +y, -y]; for `multires`, this is a configuration object.
+ * @param {string} imageType - The type of the image: `equirectangular`,
+ *      `cubemap`, or `multires`.
+ * @param {boolean} dynamic - Whether or not the image is dynamic (e.g. video).
  */
-function Renderer(container, image, imageType, video) {
-    this.container = container;
-    this.canvas = container.querySelector('#canvas');
-    this.image = image;
-    this.video = video;
+function Renderer(container, image, imageType, dynamic) {
+    var canvas = document.createElement('canvas');
+    canvas.style.width = canvas.style.height = '100%';
+    container.appendChild(canvas);
 
     // Default argument for image type
-    this.imageType = 'equirectangular';
-    if (typeof imageType != 'undefined'){
-        this.imageType = imageType;
+    if (typeof imageType === undefined){
+        imageType = 'equirectangular';
     }
 
     var program, gl;
+    var fallbackImgSize;
+    var world;
+    var vtmps;
+    var pose;
 
-    this.init = function(haov, vaov, voffset) {
+    /**
+     * Initialize renderer.
+     * @memberof Renderer
+     * @instance
+     * @param {number} haov - Initial horizontal angle of view.
+     * @param {number} vaov - Initial vertical angle of view.
+     * @param {number} voffset - Initial vertical offset angle.
+     * @param {function} callback - Load callback function.
+     */
+    this.init = function(haov, vaov, voffset, callback) {
         var s;
         
-        // Enable WebGL on canvas
-        gl = this.canvas.getContext('experimental-webgl', {alpha: false, depth: false});
+        // This awful browser specific test exists because iOS 8 and IE 11
+        // don't display non-power-of-two cubemap textures but also don't
+        // throw an error (tested on an iPhone 5c / iOS 8.1.3). Therefore, the
+        // WebGL context is never created for these browsers for NPOT cubemaps,
+        // and the CSS 3D transform fallback renderer is used instead.
+        if (!(imageType == 'cubemap' &&
+            (image[0].width & (image[0].width - 1)) !== 0 &&
+            (navigator.userAgent.toLowerCase().match(/(iphone|ipod|ipad).* os 8_/) ||
+            navigator.userAgent.match(/Trident.*rv[ :]*11\./)))) {
+            // Enable WebGL on canvas
+            gl = canvas.getContext('experimental-webgl', {alpha: false, depth: false});
+        }
         
         // If there is no WebGL, fall back to CSS 3D transform renderer.
         // While browser specific tests are usually frowned upon, the
-        // fallback viewer only really works with WebKit/Blink
-        if (!gl && this.imageType == 'multires' && this.image.fallbackPath && 'WebkitAppearance' in document.documentElement.style) {
+        // fallback viewer only really works with WebKit/Blink and IE 10/11
+        // (it doesn't work properly in Firefox).
+        if (!gl && ((imageType == 'multires' && image.hasOwnProperty('fallbackPath')) ||
+            imageType == 'cubemap') &&
+            ('WebkitAppearance' in document.documentElement.style ||
+            navigator.userAgent.match(/Trident.*rv[ :]*11\./) ||
+            navigator.appVersion.indexOf('MSIE 10') !== -1)) {
+            // Remove old world if it exists
+            if (world) {
+                container.removeChild(world);
+            }
+            
             // Initialize renderer
-            container.className = 'viewport';
-            this.world = container.querySelector('.world');
-            this.world.style.display = 'block';
+            world = document.createElement('div');
+            world.className = 'pnlm-world';
             
             // Add images
-            var path = this.image.basePath + this.image.fallbackPath;
-            var sides = ['f', 'b', 'u', 'd', 'l', 'r'];
+            var path;
+            if (image.basePath) {
+                path = image.basePath + image.fallbackPath;
+            } else {
+                path = image.fallbackPath;
+            }
+            var sides = ['f', 'r', 'b', 'l', 'u', 'd'];
+            var loaded = 0;
+            var onLoad = function() {
+                // Draw image on canvas
+                var faceCanvas = document.createElement('canvas');
+                faceCanvas.className = 'pnlm-face pnlm-' + sides[this.side] + 'face';
+                world.appendChild(faceCanvas);
+                var faceContext = faceCanvas.getContext('2d');
+                faceCanvas.style.width = this.width + 4 + 'px';
+                faceCanvas.style.height = this.height + 4 + 'px';
+                faceCanvas.width = this.width + 4;
+                faceCanvas.height = this.height + 4;
+                faceContext.drawImage(this, 2, 2);
+                var imgData = faceContext.getImageData(0, 0, faceCanvas.width, faceCanvas.height);
+                var data = imgData.data;
+                
+                // Duplicate edge pixels
+                var i;
+                var j;
+                for (i = 2; i < faceCanvas.width - 2; i++) {
+                    for (j = 0; j < 4; j++) {
+                        data[(i + faceCanvas.width) * 4 + j] = data[(i + faceCanvas.width * 2) * 4 + j];
+                        data[(i + faceCanvas.width * (faceCanvas.height - 2)) * 4 + j] = data[(i + faceCanvas.width * (faceCanvas.height - 3)) * 4 + j];
+                    }
+                }
+                for (i = 2; i < faceCanvas.height - 2; i++) {
+                    for (j = 0; j < 4; j++) {
+                        data[(i * faceCanvas.width + 1) * 4 + j] = data[(i * faceCanvas.width + 2) * 4 + j];
+                        data[((i + 1) * faceCanvas.width - 2) * 4 + j] = data[((i + 1) * faceCanvas.width - 3) * 4 + j];
+                    }
+                }
+                for (j = 0; j < 4; j++) {
+                    data[(faceCanvas.width + 1) * 4 + j] = data[(faceCanvas.width * 2 + 2) * 4 + j];
+                    data[(faceCanvas.width * 2 - 2) * 4 + j] = data[(faceCanvas.width * 3 - 3) * 4 + j];
+                    data[(faceCanvas.width * (faceCanvas.height - 2) + 1) * 4 + j] = data[(faceCanvas.width * (faceCanvas.height - 3) + 2) * 4 + j];
+                    data[(faceCanvas.width * (faceCanvas.height - 1) - 2) * 4 + j] = data[(faceCanvas.width * (faceCanvas.height - 2) - 3) * 4 + j];
+                }
+                for (i = 1; i < faceCanvas.width - 1; i++) {
+                    for (j = 0; j < 4; j++) {
+                        data[i * 4 + j] = data[(i + faceCanvas.width) * 4 + j];
+                        data[(i + faceCanvas.width * (faceCanvas.height - 1)) * 4 + j] = data[(i + faceCanvas.width * (faceCanvas.height - 2)) * 4 + j];
+                    }
+                }
+                for (i = 1; i < faceCanvas.height - 1; i++) {
+                    for (j = 0; j < 4; j++) {
+                        data[(i * faceCanvas.width) * 4 + j] = data[(i * faceCanvas.width + 1) * 4 + j];
+                        data[((i + 1) * faceCanvas.width - 1) * 4 + j] = data[((i + 1) * faceCanvas.width - 2) * 4 + j];
+                    }
+                }
+                for (j = 0; j < 4; j++) {
+                    data[j] = data[(faceCanvas.width + 1) * 4 + j];
+                    data[(faceCanvas.width - 1) * 4 + j] = data[(faceCanvas.width * 2 - 2) * 4 + j];
+                    data[(faceCanvas.width * (faceCanvas.height - 1)) * 4 + j] = data[(faceCanvas.width * (faceCanvas.height - 2) + 1) * 4 + j];
+                    data[(faceCanvas.width * faceCanvas.height - 1) * 4 + j] = data[(faceCanvas.width * (faceCanvas.height - 1) - 2) * 4 + j];
+                }
+                
+                // Draw image width duplicated edge pixels on canvas
+                faceContext.putImageData(imgData, 0, 0);
+                
+                loaded++;
+                if (loaded == 6) {
+                    fallbackImgSize = this.width;
+                    container.appendChild(world);
+                    callback();
+                }
+            };
             for (s = 0; s < 6; s++) {
-                this.world.querySelector('.' + sides[s] + 'face').style.backgroundImage = 'url("' + path.replace('%s',sides[s]) + '.' + this.image.extension + '")';
+                var faceImg = new Image();
+                faceImg.crossOrigin = 'anonymous';
+                faceImg.side = s;
+                faceImg.onload = onLoad;
+                if (imageType == 'multires') {
+                    faceImg.src = encodeURI(path.replace('%s', sides[s]) + '.' + image.extension);
+                } else {
+                    faceImg.src = encodeURI(image[s].src);
+                }
             }
             
             return;
@@ -71,82 +186,104 @@ function Renderer(container, image, imageType, video) {
             console.log('Error: no WebGL support detected!');
             throw {type: 'no webgl'};
         }
-        if (this.image.basePath) {
-            this.image.fullpath = this.image.basePath + this.image.path;
+        if (image.basePath) {
+            image.fullpath = image.basePath + image.path;
         } else {
-            this.image.fullpath = this.image.path;
+            image.fullpath = image.path;
         }
-        this.image.invTileResolution = 1 / this.image.tileResolution;
+        image.invTileResolution = 1 / image.tileResolution;
         
-        var vertices = this.createCube();
-        this.vtmp = [];
+        var vertices = createCube();
+        vtmps = [];
         for (s = 0; s < 6; s++) {
-            this.vtmp[s] = vertices.slice(s * 12, s * 12 + 12);
-            vertices = this.createCube();
+            vtmps[s] = vertices.slice(s * 12, s * 12 + 12);
+            vertices = createCube();
         }
         
-        
+        // Make sure image isn't too big
+        var width, maxWidth;
+        if (imageType == 'equirectangular') {
+            width = Math.max(image.width, image.height);
+            maxWidth = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+            if (width > maxWidth) {
+                console.log('Error: The image is too big; it\'s ' + width + 'px wide, but this device\'s maximum supported width is ' + maxWidth + 'px.');
+                throw {type: 'webgl size error', width: width, maxWidth: maxWidth};
+            }
+        } else if (imageType == 'cubemap') {
+            width = image[0].width;
+            maxWidth = gl.getParameter(gl.MAX_CUBE_MAP_TEXTURE_SIZE);
+            if (width > maxWidth) {
+                console.log('Error: The cube face image is too big; it\'s ' + width + 'px wide, but this device\'s maximum supported width is ' + maxWidth + 'px.');
+                throw {type: 'webgl size error', width: width, maxWidth: maxWidth};
+            }
+        }
+
+        // Store horizon pitch and roll if applicable
+        if (image.horizonPitch && image.horizonRoll) {
+            pose = [image.horizonPitch, image.horizonRoll];
+        }
+
         // Set 2d texture binding
         var glBindType = gl.TEXTURE_2D;
 
         // Create viewport for entire canvas
-        gl.viewport(0, 0, this.canvas.width, this.canvas.height);   
+        gl.viewport(0, 0, canvas.width, canvas.height);
 
         // Create vertex shader
         var vs = gl.createShader(gl.VERTEX_SHADER);
         var vertexSrc = v;
-        if (this.imageType == 'multires') {
+        if (imageType == 'multires') {
             vertexSrc = vMulti;
         }
         gl.shaderSource(vs, vertexSrc);
         gl.compileShader(vs);
-        
+
         // Create fragment shader
         var fs = gl.createShader(gl.FRAGMENT_SHADER);
         var fragmentSrc = fragEquirectangular;
-        if (this.imageType == 'cubemap') {
+        if (imageType == 'cubemap') {
             glBindType = gl.TEXTURE_CUBE_MAP;
             fragmentSrc = fragCube;
-        } else if (this.imageType == 'multires') {
+        } else if (imageType == 'multires') {
             fragmentSrc = fragMulti;
         }
         gl.shaderSource(fs, fragmentSrc);
         gl.compileShader(fs);
-        
+
         // Link WebGL program
         program = gl.createProgram();
         gl.attachShader(program, vs);
         gl.attachShader(program, fs);
         gl.linkProgram(program);
-        
+
         // Log errors
-        if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) 
+        if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS))
             console.log(gl.getShaderInfoLog(vs));
         if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS))
             console.log(gl.getShaderInfoLog(fs));
         if (!gl.getProgramParameter(program, gl.LINK_STATUS))
             console.log(gl.getProgramInfoLog(program));
-        
+
         // Use WebGL program
         gl.useProgram(program);
-        
+
         program.drawInProgress = false;
-        
+
         // Look up texture coordinates location
         program.texCoordLocation = gl.getAttribLocation(program, 'a_texCoord');
         gl.enableVertexAttribArray(program.texCoordLocation);
-        
-        if (this.imageType != 'multires') {
+
+        if (imageType != 'multires') {
             // Provide texture coordinates for rectangle
             program.texCoordBuffer = gl.createBuffer();
             gl.bindBuffer(gl.ARRAY_BUFFER, program.texCoordBuffer);
             gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,1,1,1,1,-1,-1,1,1,-1,-1,-1]), gl.STATIC_DRAW);
             gl.vertexAttribPointer(program.texCoordLocation, 2, gl.FLOAT, false, 0, 0);
-            
+
             // Pass aspect ratio
             program.aspectRatio = gl.getUniformLocation(program, 'u_aspectRatio');
-            gl.uniform1f(program.aspectRatio, this.canvas.width / this.canvas.height);
-            
+            gl.uniform1f(program.aspectRatio, canvas.width / canvas.height);
+
             // Locate psi, theta, focal length, horizontal extent, vertical extent, and vertical offset
             program.psi = gl.getUniformLocation(program, 'u_psi');
             program.theta = gl.getUniformLocation(program, 'u_theta');
@@ -154,119 +291,199 @@ function Renderer(container, image, imageType, video) {
             program.h = gl.getUniformLocation(program, 'u_h');
             program.v = gl.getUniformLocation(program, 'u_v');
             program.vo = gl.getUniformLocation(program, 'u_vo');
-            
+            program.rot = gl.getUniformLocation(program, 'u_rot');
+
             // Pass horizontal extent, vertical extent, and vertical offset
             gl.uniform1f(program.h, haov / (Math.PI * 2.0));
             gl.uniform1f(program.v, vaov / Math.PI);
-            gl.uniform1f(program.vo, voffset / Math.PI);
-            
+            gl.uniform1f(program.vo, voffset / Math.PI * 2);
+
             // Create texture
             program.texture = gl.createTexture();
             gl.bindTexture(glBindType, program.texture);
-            
+
             // Upload images to texture depending on type
-            if (this.imageType == 'cubemap') {
+            if (imageType == 'cubemap') {
                 // Load all six sides of the cube map
-                gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_X, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, this.image[1]);
-                gl.texImage2D(gl.TEXTURE_CUBE_MAP_NEGATIVE_X, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, this.image[3]);
-                gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_Y, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, this.image[4]);
-                gl.texImage2D(gl.TEXTURE_CUBE_MAP_NEGATIVE_Y, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, this.image[5]);
-                gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_Z, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, this.image[0]);
-                gl.texImage2D(gl.TEXTURE_CUBE_MAP_NEGATIVE_Z, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, this.image[2]);
+                gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_X, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, image[1]);
+                gl.texImage2D(gl.TEXTURE_CUBE_MAP_NEGATIVE_X, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, image[3]);
+                gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_Y, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, image[4]);
+                gl.texImage2D(gl.TEXTURE_CUBE_MAP_NEGATIVE_Y, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, image[5]);
+                gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_Z, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, image[0]);
+                gl.texImage2D(gl.TEXTURE_CUBE_MAP_NEGATIVE_Z, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, image[2]);
             } else {
                 // Upload image to the texture
-                gl.texImage2D(glBindType, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, this.image);
+                gl.texImage2D(glBindType, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, image);
             }
-            
+
             // Set parameters for rendering any size
             gl.texParameteri(glBindType, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
             gl.texParameteri(glBindType, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
             gl.texParameteri(glBindType, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
             gl.texParameteri(glBindType, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-            
+
         } else {
             // Look up vertex coordinates location
             program.vertPosLocation = gl.getAttribLocation(program, 'a_vertCoord');
             gl.enableVertexAttribArray(program.vertPosLocation);
-            
+
             // Create buffers
             program.cubeVertBuf = gl.createBuffer();
             program.cubeVertTexCoordBuf = gl.createBuffer();
             program.cubeVertIndBuf = gl.createBuffer();
-            
+
             // Bind texture coordinate buffer and pass coordinates to WebGL
             gl.bindBuffer(gl.ARRAY_BUFFER, program.cubeVertTexCoordBuf);
             gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,0,1,0,1,1,0,1]), gl.STATIC_DRAW);
-            
+
             // Bind square index buffer and pass indicies to WebGL
             gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, program.cubeVertIndBuf);
             gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0,1,2,0,2,3]), gl.STATIC_DRAW);
-            
+
             // Find uniforms
             program.perspUniform = gl.getUniformLocation(program, 'u_perspMatrix');
             program.cubeUniform = gl.getUniformLocation(program, 'u_cubeMatrix');
             //program.colorUniform = gl.getUniformLocation(program, 'u_color');
-            
+
             program.level = -1;
-            
+
             program.currentNodes = [];
             program.nodeCache = [];
             program.nodeCacheTimestamp = 0;
         }
-        
+
         // Check if there was an error
         if (gl.getError() !== 0) {
-            var width, maxWidth;
             console.log('Error: Something went wrong with WebGL!');
-            if (this.imageType == 'equirectangular') {
-                width = Math.max(this.image.width, this.image.height);
-                maxWidth = gl.getParameter(gl.MAX_TEXTURE_SIZE);
-                if (width > maxWidth) {
-                    console.log('Error: The image is too big; it\'s ' + width + 'px wide, but this device\'s maximum supported width is ' + maxWidth + 'px.');
-                    throw {type: 'webgl size error', width: width, maxWidth: maxWidth};
-                }
-            } else if (this.imageType == 'cubemap') {
-                width = this.image[0].width;
-                maxWidth = gl.getParameter(gl.MAX_CUBE_MAP_TEXTURE_SIZE);
-                if (width > maxWidth) {
-                    console.log('Error: The cube face image is too big; it\'s ' + width + 'px wide, but this device\'s maximum supported width is ' + maxWidth + 'px.');
-                    throw {type: 'webgl size error', width: width, maxWidth: maxWidth};
-                }
-            }
             throw {type: 'webgl error'};
+        }
+
+        callback();
+     };
+
+    /**
+     * Destroy renderer.
+     * @memberof Renderer
+     * @instance
+     */
+    this.destroy = function() {
+        if (container !== undefined) {
+            if (canvas !== undefined) {
+                container.removeChild(canvas);
+            }
+            if (world !== undefined) {
+                container.removeChild(world);
+            }
         }
     };
 
-    this.render = function(pitch, yaw, hfov) {
-        var focal;
+    /**
+     * Resize renderer (call after resizing container).
+     * @memberof Renderer
+     * @instance
+     */
+    this.resize = function() {
+        var pixelRatio = window.devicePixelRatio || 1;
+        canvas.width = canvas.clientWidth * pixelRatio;
+        canvas.height = canvas.clientHeight * pixelRatio;
+        if (gl) {
+            gl.viewport(0, 0, canvas.width, canvas.height);
+            if (imageType != 'multires') {
+                gl.uniform1f(program.aspectRatio, canvas.width / canvas.height);
+            }
+        }
+    };
+    // Initialize canvas size
+    this.resize();
+
+    /**
+     * Render new view of panorama.
+     * @memberof Renderer
+     * @instance
+     * @param {number} pitch - Pitch to render at.
+     * @param {number} yaw - Yaw to render at.
+     * @param {number} hfov - Horizontal field of view to render with.
+     * @param {boolean} returnImage - Return rendered image?
+     */
+    this.render = function(pitch, yaw, hfov, returnImage) {
+        var focal, i, s;
         
         // If no WebGL
-        if (!gl && this.imageType == 'multires') {
+        if (!gl && (imageType == 'multires' || imageType == 'cubemap')) {
+            // Determine face transforms
+            s = fallbackImgSize / 2;
+            
+            var transforms = {
+                f: 'translate3d(-' + (s + 2) + 'px, -' + (s + 2) + 'px, -' + s + 'px)',
+                b: 'translate3d(' + (s + 2) + 'px, -' + (s + 2) + 'px, ' + s + 'px) rotateX(180deg) rotateZ(180deg)',
+                u: 'translate3d(-' + (s + 2) + 'px, -' + s + 'px, ' + (s + 2) + 'px) rotateX(270deg)',
+                d: 'translate3d(-' + (s + 2) + 'px, ' + s + 'px, -' + (s + 2) + 'px) rotateX(90deg)',
+                l: 'translate3d(-' + s + 'px, -' + (s + 2) + 'px, ' + (s + 2) + 'px) rotateX(180deg) rotateY(90deg) rotateZ(180deg)',
+                r: 'translate3d(' + s + 'px, -' + (s + 2) + 'px, -' + (s + 2) + 'px) rotateY(270deg)'
+            };
             focal = 1 / Math.tan(hfov / 2);
-            var zoom = focal * this.canvas.width / 2 + 'px';
-            var transform = 'translate3d(0px, 0px, ' + zoom + ') rotateX(' + pitch + 'rad) rotateY(' + yaw + 'rad) rotateZ(0rad)';
-            this.world.style.webkitTransform = transform;
-            this.world.style.transform = transform;
-            this.container.style.webkitPerspective = zoom;
-            this.container.style.perspective = zoom;
+            var zoom = focal * canvas.width / 2 + 'px';
+            var transform = 'perspective(' + zoom + ') translateZ(' + zoom + ') rotateX(' + pitch + 'rad) rotateY(' + yaw + 'rad) ';
+            
+            // Apply face transforms
+            var faces = Object.keys(transforms);
+            for (i = 0; i < 6; i++) {
+                var face = world.querySelector('.pnlm-' + faces[i] + 'face').style;
+                face.webkitTransform = transform + transforms[faces[i]];
+                face.transform = transform + transforms[faces[i]];
+            }
             return;
         }
         
-        if (this.imageType != 'multires') {
+        if (imageType != 'multires') {
             // Calculate focal length from vertical field of view
-            var vfov = 2 * Math.atan(Math.tan(hfov * 0.5) / (this.canvas.width / this.canvas.height));
+            var vfov = 2 * Math.atan(Math.tan(hfov * 0.5) / (canvas.width / canvas.height));
             focal = 1 / Math.tan(vfov * 0.5);
-            
+
+            // Apply pitch and roll transformation if applicable
+            if (imageType == 'equirectangular' && pose !== undefined) {
+                var horizonPitch = pose[0],
+                    horizonRoll = pose[1];
+
+                // Calculate new pitch and yaw
+                var orig_pitch = pitch,
+                    orig_yaw = yaw,
+                    x = Math.cos(horizonRoll) * Math.sin(pitch) * Math.sin(horizonPitch) +
+                        Math.cos(pitch) * (Math.cos(horizonPitch) * Math.cos(yaw) +
+                        Math.sin(horizonRoll) * Math.sin(horizonPitch) * Math.sin(yaw)),
+                    y = -Math.sin(pitch) * Math.sin(horizonRoll) +
+                        Math.cos(pitch) * Math.cos(horizonRoll) * Math.sin(yaw),
+                    z = Math.cos(horizonRoll) * Math.cos(horizonPitch) * Math.sin(pitch) +
+                        Math.cos(pitch) * (-Math.cos(yaw) * Math.sin(horizonPitch) +
+                        Math.cos(horizonPitch) * Math.sin(horizonRoll) * Math.sin(yaw));
+                pitch = Math.asin(z);
+                yaw = Math.atan2(y, x);
+
+                // Calculate roll
+                var v = [Math.cos(orig_pitch) * (Math.sin(horizonRoll) * Math.sin(horizonPitch) * Math.cos(orig_yaw) -
+                        Math.cos(horizonPitch) * Math.sin(orig_yaw)),
+                        Math.cos(orig_pitch) * Math.cos(horizonRoll) * Math.cos(orig_yaw),
+                        Math.cos(orig_pitch) * (Math.cos(horizonPitch) * Math.sin(horizonRoll) * Math.cos(orig_yaw) +
+                        Math.sin(orig_yaw) * Math.sin(horizonPitch))],
+                    w = [-Math.cos(pitch) * Math.sin(yaw), Math.cos(pitch) * Math.cos(yaw)];
+                var roll = Math.acos((v[0]*w[0] + v[1]*w[1]) /
+                    (Math.sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]) *
+                    Math.sqrt(w[0]*w[0]+w[1]*w[1])));
+                if (v[2] < 0)
+                    roll = 2 * Math.PI - roll;
+                gl.uniform1f(program.rot, roll);
+            }
+
             // Pass psi, theta, and focal length
             gl.uniform1f(program.psi, yaw);
             gl.uniform1f(program.theta, pitch);
             gl.uniform1f(program.f, focal);
             
-            if (this.video === true) {
-                // Update texture if video
-                if (this.imageType == 'equirectangular') {
+            if (dynamic === true) {
+                // Update texture if dynamic
+                if (imageType == 'equirectangular') {
                     gl.bindTexture(gl.TEXTURE_2D, program.texture);
-                    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, this.image);
+                    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, image);
                 }
             }
             
@@ -275,24 +492,24 @@ function Renderer(container, image, imageType, video) {
         
         } else {
             // Create perspective matrix
-            var perspMatrix = this.makePersp(hfov, this.canvas.width / this.canvas.height, 0.1, 100.0);
+            var perspMatrix = makePersp(hfov, canvas.width / canvas.height, 0.1, 100.0);
             
             // Find correct zoom level
-            this.checkZoom(hfov);
+            checkZoom(hfov);
             
             // Create rotation matrix
-            var matrix = this.identityMatrix3();
-            matrix = this.rotateMatrix(matrix, -pitch, 'x');
-            matrix = this.rotateMatrix(matrix, yaw, 'y');
-            matrix = this.makeMatrix4(matrix);
+            var matrix = identityMatrix3();
+            matrix = rotateMatrix(matrix, -pitch, 'x');
+            matrix = rotateMatrix(matrix, yaw, 'y');
+            matrix = makeMatrix4(matrix);
             
             // Set matrix uniforms
-            gl.uniformMatrix4fv(program.perspUniform, false, new Float32Array(this.transposeMatrix4(perspMatrix)));
-            gl.uniformMatrix4fv(program.cubeUniform, false, new Float32Array(this.transposeMatrix4(matrix)));
+            gl.uniformMatrix4fv(program.perspUniform, false, new Float32Array(transposeMatrix4(perspMatrix)));
+            gl.uniformMatrix4fv(program.cubeUniform, false, new Float32Array(transposeMatrix4(matrix)));
             
             // Find current nodes
-            var rotPersp = this.rotatePersp(perspMatrix, matrix);
-            program.nodeCache.sort(this.multiresNodeSort);
+            var rotPersp = rotatePersp(perspMatrix, matrix);
+            program.nodeCache.sort(multiresNodeSort);
             if (program.nodeCache.length > 200 &&
                 program.nodeCache.length > program.currentNodes.length + 50) {
                 // Remove older nodes from cache
@@ -301,26 +518,36 @@ function Renderer(container, image, imageType, video) {
             program.currentNodes = [];
             
             var sides = ['f', 'b', 'u', 'd', 'l', 'r'];
-            for ( var s = 0; s < 6; s++ ) {
-                var ntmp = new MultiresNode(this.vtmp[s], sides[s], 1, 0, 0, this.image.fullpath);
-                this.testMultiresNode(rotPersp, ntmp, pitch, yaw, hfov);
+            for (s = 0; s < 6; s++) {
+                var ntmp = new MultiresNode(vtmps[s], sides[s], 1, 0, 0, image.fullpath);
+                testMultiresNode(rotPersp, ntmp, pitch, yaw, hfov);
             }
-            program.currentNodes.sort(this.multiresNodeRenderSort);
+            program.currentNodes.sort(multiresNodeRenderSort);
             // Only process one tile per frame to improve responsiveness
-            for ( var i = 0; i < program.currentNodes.length; i++ ) {
+            for (i = 0; i < program.currentNodes.length; i++) {
                 if (!program.currentNodes[i].texture) {
-                    setTimeout(this.processNextTile(program.currentNodes[i]), 0);
+                    setTimeout(processNextTile(program.currentNodes[i]), 0);
                     break;
                 }
             }
             
             // Draw tiles
-            this.multiresDraw();
+            multiresDraw();
+        }
+        
+        if (returnImage !== undefined) {
+            return canvas.toDataURL('image/png');
         }
     };
     
+    /**
+     * Check if images are loading.
+     * @memberof Renderer
+     * @instance
+     * @returns {boolean} Whether or not images are loading.
+     */
     this.isLoading = function() {
-        if (gl && this.imageType == 'multires') {
+        if (gl && imageType == 'multires') {
             for ( var i = 0; i < program.currentNodes.length; i++ ) {
                 if (!program.currentNodes[i].textureLoaded) {
                     return true;
@@ -330,7 +557,24 @@ function Renderer(container, image, imageType, video) {
         return false;
     };
     
-    this.multiresNodeSort = function(a, b) {
+    /**
+     * Retrieve renderer's canvas.
+     * @memberof Renderer
+     * @instance
+     * @returns {HTMLElement} Renderer's canvas.
+     */
+    this.getCanvas = function() {
+        return canvas;
+    };
+    
+    /**
+     * Sorting method for multires nodes.
+     * @private
+     * @param {MultiresNode} a - First node.
+     * @param {MultiresNode} b - Second node.
+     * @returns {number} Base tiles first, then higher timestamp first.
+     */
+    function multiresNodeSort(a, b) {
         // Base tiles are always first
         if (a.level == 1 && b.level != 1) {
             return -1;
@@ -341,9 +585,16 @@ function Renderer(container, image, imageType, video) {
         
         // Higher timestamp first
         return b.timestamp - a.timestamp;
-    };
+    }
     
-    this.multiresNodeRenderSort = function(a, b) {
+    /**
+     * Sorting method for multires node rendering.
+     * @private
+     * @param {MultiresNode} a - First node.
+     * @param {MultiresNode} b - Second node.
+     * @returns {number} Lower zoom levels first, then closest to center first.
+     */
+    function multiresNodeRenderSort(a, b) {
         // Lower zoom levels first
         if (a.level != b.level) {
             return a.level - b.level;
@@ -351,9 +602,13 @@ function Renderer(container, image, imageType, video) {
         
         // Lower distance from center first
         return a.diff - b.diff;
-    };
+    }
     
-    this.multiresDraw = function() {
+    /**
+     * Draws multires nodes.
+     * @private
+     */
+    function multiresDraw() {
         if (!program.drawInProgress) {
             program.drawInProgress = true;
             for ( var i = 0; i < program.currentNodes.length; i++ ) {
@@ -377,8 +632,19 @@ function Renderer(container, image, imageType, video) {
             }
             program.drawInProgress = false;
         }
-    };
+    }
 
+    /**
+     * Creates new multires node.
+     * @constructor
+     * @private
+     * @param {number[]} vertices - Node's verticies.
+     * @param {string} side - Node's cube face.
+     * @param {number} level - Node's zoom level.
+     * @param {number} x - Node's x position.
+     * @param {number} y - Node's y position.
+     * @param {string} path - Node's path.
+     */
     function MultiresNode(vertices, side, level, x, y, path) {
         this.vertices = vertices;
         this.side = side;
@@ -388,8 +654,18 @@ function Renderer(container, image, imageType, video) {
         this.path = path.replace('%s',side).replace('%l',level).replace('%x',x).replace('%y',y);
     }
 
-    this.testMultiresNode = function(rotPersp, node, pitch, yaw, hfov) {
-        if (this.checkSquareInView(rotPersp, node.vertices)) {
+    /**
+     * Test if multires node is visible. If it is, add it to current nodes,
+     * load its texture, and load appropriate child nodes.
+     * @private
+     * @param {number[]} rotPersp - Rotated perspective matrix.
+     * @param {MultiresNode} node - Multires node to check.
+     * @param {number} pitch - Pitch to check at.
+     * @param {number} yaw - Yaw to check at.
+     * @param {number} hfov - Horizontal field of view to check at.
+     */
+    function testMultiresNode(rotPersp, node, pitch, yaw, hfov) {
+        if (checkSquareInView(rotPersp, node.vertices)) {
             // Calculate central angle between center of view and center of tile
             var v = node.vertices;
             var x = v[0] + v[3] + v[6] + v[ 9];
@@ -424,26 +700,26 @@ function Renderer(container, image, imageType, video) {
             // TODO: Test error
             // Create child nodes
             if (node.level < program.level) {
-                var cubeSize = this.image.cubeResolution * Math.pow(2, node.level - this.image.maxLevel);
-                var numTiles = Math.ceil(cubeSize * this.image.invTileResolution) - 1;
-                var doubleTileSize = cubeSize % this.image.tileResolution * 2;
-                var lastTileSize = (cubeSize * 2) % this.image.tileResolution;
+                var cubeSize = image.cubeResolution * Math.pow(2, node.level - image.maxLevel);
+                var numTiles = Math.ceil(cubeSize * image.invTileResolution) - 1;
+                var doubleTileSize = cubeSize % image.tileResolution * 2;
+                var lastTileSize = (cubeSize * 2) % image.tileResolution;
                 if (lastTileSize === 0) {
-                    lastTileSize = this.image.tileResolution;
+                    lastTileSize = image.tileResolution;
                 }
                 if (doubleTileSize === 0) {
-                    doubleTileSize = this.image.tileResolution * 2;
+                    doubleTileSize = image.tileResolution * 2;
                 }
                 var f = 0.5;
                 if (node.x == numTiles || node.y == numTiles) {
-                    f = 1.0 - this.image.tileResolution / (this.image.tileResolution + lastTileSize);
+                    f = 1.0 - image.tileResolution / (image.tileResolution + lastTileSize);
                 }
                 var i = 1.0 - f;
                 var children = [];
                 var vtmp, ntmp;
                 var f1 = f, f2 = f, f3 = f, i1 = i, i2 = i, i3 = i;
                 // Handle non-symmetric tiles
-                if (lastTileSize < this.image.tileResolution) {
+                if (lastTileSize < image.tileResolution) {
                     if (node.x == numTiles && node.y != numTiles) {
                         f2 = 0.5;
                         i2 = 0.5;
@@ -461,7 +737,7 @@ function Renderer(container, image, imageType, video) {
                     }
                 }
                 // Handle small tiles that have fewer than four children
-                if (doubleTileSize < this.image.tileResolution) {
+                if (doubleTileSize < image.tileResolution) {
                     if (node.x == numTiles) {
                         f1 = 0;
                         i1 = 1;
@@ -485,54 +761,49 @@ function Renderer(container, image, imageType, video) {
                         v[0]*f1+v[6]*i1,  v[1]*f2+v[7]*i2,  v[2]*f3+v[8]*i3,
                           v[0]*f+v[9]*i, v[1]*f2+v[10]*i2, v[2]*f3+v[11]*i3
                 ];
-                ntmp = new MultiresNode(vtmp, node.side, node.level + 1, node.x*2, node.y*2, this.image.fullpath);
+                ntmp = new MultiresNode(vtmp, node.side, node.level + 1, node.x*2, node.y*2, image.fullpath);
                 children.push(ntmp);
-                if (!(node.x == numTiles && doubleTileSize < this.image.tileResolution)) {
+                if (!(node.x == numTiles && doubleTileSize < image.tileResolution)) {
                     vtmp = [v[0]*f1+v[3]*i1,    v[1]*f+v[4]*i,  v[2]*f3+v[5]*i3,
                                        v[3],             v[4],             v[5],
                               v[3]*f+v[6]*i,  v[4]*f2+v[7]*i2,  v[5]*f3+v[8]*i3,
                             v[0]*f1+v[6]*i1,  v[1]*f2+v[7]*i2,  v[2]*f3+v[8]*i3
                     ];
-                    ntmp = new MultiresNode(vtmp, node.side, node.level + 1, node.x*2+1, node.y*2, this.image.fullpath);
+                    ntmp = new MultiresNode(vtmp, node.side, node.level + 1, node.x*2+1, node.y*2, image.fullpath);
                     children.push(ntmp);
                 }
-                if (!(node.x == numTiles && doubleTileSize < this.image.tileResolution) &&
-                    !(node.y == numTiles && doubleTileSize < this.image.tileResolution)) {
+                if (!(node.x == numTiles && doubleTileSize < image.tileResolution) &&
+                    !(node.y == numTiles && doubleTileSize < image.tileResolution)) {
                     vtmp = [v[0]*f1+v[6]*i1,  v[1]*f2+v[7]*i2,  v[2]*f3+v[8]*i3,
                               v[3]*f+v[6]*i,  v[4]*f2+v[7]*i2,  v[5]*f3+v[8]*i3,
                                        v[6],             v[7],             v[8],
                             v[9]*f1+v[6]*i1,   v[10]*f+v[7]*i, v[11]*f3+v[8]*i3
                     ];
-                    ntmp = new MultiresNode(vtmp, node.side, node.level + 1, node.x*2+1, node.y*2+1, this.image.fullpath);
+                    ntmp = new MultiresNode(vtmp, node.side, node.level + 1, node.x*2+1, node.y*2+1, image.fullpath);
                     children.push(ntmp);
                 }
-                if (!(node.y == numTiles && doubleTileSize < this.image.tileResolution)) {
+                if (!(node.y == numTiles && doubleTileSize < image.tileResolution)) {
                     vtmp = [  v[0]*f+v[9]*i, v[1]*f2+v[10]*i2, v[2]*f3+v[11]*i3,
                             v[0]*f1+v[6]*i1,  v[1]*f2+v[7]*i2,  v[2]*f3+v[8]*i3,
                             v[9]*f1+v[6]*i1,   v[10]*f+v[7]*i, v[11]*f3+v[8]*i3,
                                        v[9],            v[10],            v[11]
                     ];
-                    ntmp = new MultiresNode(vtmp, node.side, node.level + 1, node.x*2, node.y*2+1, this.image.fullpath);
+                    ntmp = new MultiresNode(vtmp, node.side, node.level + 1, node.x*2, node.y*2+1, image.fullpath);
                     children.push(ntmp);
                 }
                 for (var j = 0; j < children.length; j++) {
-                    this.testMultiresNode(rotPersp, children[j], pitch, yaw, hfov);
+                    testMultiresNode(rotPersp, children[j], pitch, yaw, hfov);
                 }
             }
         }
-    };
-
-    this.setImage = function(image) {
-        this.image = image;
-        this.init();
-    };
+    }
     
-    this.setCanvas = function(canvas) {
-        this.canvas = canvas;
-        this.init();
-    };
-    
-    this.createCube = function() {
+    /**
+     * Creates cube vertex array.
+     * @private
+     * @returns {number[]} Cube vertex array.
+     */
+    function createCube() {
         return [-1,  1, -1,  1,  1, -1,  1, -1, -1, -1, -1, -1, // Front face
                  1,  1,  1, -1,  1,  1, -1, -1,  1,  1, -1,  1, // Back face
                 -1,  1,  1,  1,  1,  1,  1,  1, -1, -1,  1, -1, // Up face
@@ -540,18 +811,30 @@ function Renderer(container, image, imageType, video) {
                 -1,  1,  1, -1,  1, -1, -1, -1, -1, -1, -1,  1, // Left face
                  1,  1, -1,  1,  1,  1,  1, -1,  1,  1, -1, -1  // Right face
         ];
-    };
+    }
     
-    this.identityMatrix3 = function() {
+    /**
+     * Creates 3x3 identity matrix.
+     * @private
+     * @returns {number[]} Identity matrix.
+     */
+    function identityMatrix3() {
         return [
             1, 0, 0,
             0, 1, 0,
             0, 0, 1
         ];
-    };
+    }
     
-    // angle in radians
-    this.rotateMatrix = function(m, angle, axis) {
+    /**
+     * Rotates a 3x3 matrix.
+     * @private
+     * @param {number[]} m - Matrix to rotate.
+     * @param {number[]} angle - Angle to rotate by in radians.
+     * @param {string} axis - Axis to rotate about (`x` or `y`).
+     * @returns {number[]} Rotated matrix.
+     */
+    function rotateMatrix(m, angle, axis) {
         var s = Math.sin(angle);
         var c = Math.cos(angle);
         if ( axis == 'x' ) {
@@ -568,28 +851,49 @@ function Renderer(container, image, imageType, video) {
                 c*m[6] - s*m[8], m[7], c*m[8] + s*m[6]
             ];
         }
-    };
+    }
     
-    this.makeMatrix4 = function(m) {
+    /**
+     * Turns a 3x3 matrix into a 4x4 matrix.
+     * @private
+     * @param {number[]} m - Input matrix.
+     * @returns {number[]} Expanded matrix.
+     */
+    function makeMatrix4(m) {
         return [
             m[0], m[1], m[2],    0,
             m[3], m[4], m[5],    0,
             m[6], m[7], m[8],    0,
                0,    0,    0,    1
         ];
-    };
+    }
     
-    this.transposeMatrix4 = function(m) {
+    /**
+     * Transposes a 4x4 matrix.
+     * @private
+     * @param {number[]} m - Input matrix.
+     * @returns {number[]} Transposed matrix.
+     */
+    function transposeMatrix4(m) {
         return [
             m[ 0], m[ 4], m[ 8], m[12],
             m[ 1], m[ 5], m[ 9], m[13],
             m[ 2], m[ 6], m[10], m[14],
             m[ 3], m[ 7], m[11], m[15]
         ];
-    };
+    }
     
-    this.makePersp = function(hfov, aspect, znear, zfar) {
-        var fovy = 2 * Math.atan(Math.tan(hfov/2) * this.canvas.height / this.canvas.width);
+    /**
+     * Creates a perspective matrix.
+     * @private
+     * @param {number} hfov - Desired horizontal field of view.
+     * @param {number} aspect - Desired aspect ratio.
+     * @param {number} znear - Near distance.
+     * @param {number} zfar - Far distance.
+     * @returns {number[]} Generated perspective matrix.
+     */
+    function makePersp(hfov, aspect, znear, zfar) {
+        var fovy = 2 * Math.atan(Math.tan(hfov/2) * canvas.height / canvas.width);
         var f = 1 / Math.tan(fovy/2);
         return [
             f/aspect,   0,  0,  0,
@@ -597,9 +901,15 @@ function Renderer(container, image, imageType, video) {
                    0,   0,  (zfar+znear)/(znear-zfar), (2*zfar*znear)/(znear-zfar),
                    0,   0, -1,  0
         ];
-    };
+    }
     
-    this.processLoadedTexture = function(img, tex) {
+    /**
+     * Processes a loaded texture image into a WebGL texture.
+     * @private
+     * @param {Image} img - Input image.
+     * @param {WebGLTexture} tex - Texture to bind image to.
+     */
+    function processLoadedTexture(img, tex) {
         gl.bindTexture(gl.TEXTURE_2D, tex);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, img);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
@@ -607,57 +917,88 @@ function Renderer(container, image, imageType, video) {
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
         gl.bindTexture(gl.TEXTURE_2D, null);
-    };
+    }
     
-    this.processNextTile = function(node) {
+    /**
+     * Loads image and creates texture for a multires node / tile.
+     * @private
+     * @param {MultiresNode} node - Input node.
+     */
+    function processNextTile(node) {
         if (!node.texture) {
-        node.texture = gl.createTexture();
-        node.image = new Image();
-        node.image.crossOrigin = 'anonymous';
-        var self = this;
-        node.image.onload = function() {
-            self.processLoadedTexture(node.image, node.texture);
-            node.textureLoaded = true;
-        };
-        node.image.src = node.path + '.' + this.image.extension;
+            node.texture = gl.createTexture();
+            node.image = new Image();
+            node.image.crossOrigin = 'anonymous';
+            node.image.onload = function() {
+                processLoadedTexture(node.image, node.texture);
+                node.textureLoaded = true;
+                delete node.image;
+            };
+            node.image.src = encodeURI(node.path + '.' + image.extension);
         }
-    };
+    }
     
-    this.checkZoom = function(hfov) {
+    /**
+     * Finds and applies optimal multires zoom level.
+     * @private
+     * @param {number} hfov - Horizontal field of view to check at.
+     */
+    function checkZoom(hfov) {
         // Find optimal level
         var newLevel = 1;
-        while ( newLevel < this.image.maxLevel &&
-            this.canvas.width > this.image.tileResolution *
+        while ( newLevel < image.maxLevel &&
+            canvas.width > image.tileResolution *
             Math.pow(2, newLevel - 1) * Math.tan(hfov / 2) * 0.707 ) {
             newLevel++;
         }
         
         // Apply change
         program.level = newLevel;
-    };
+    }
     
-    // perspective matrix, rotation matrix
-    this.rotatePersp = function(p, r) {
+    /**
+     * Rotates perspective matrix.
+     * @private
+     * @param {number[]} p - Perspective matrix.
+     * @param {number[]} r - Rotation matrix.
+     * @returns {number[]} Rotated matrix.
+     */
+    function rotatePersp(p, r) {
         return [
             p[ 0]*r[0], p[ 0]*r[1], p[ 0]*r[ 2],     0,
             p[ 5]*r[4], p[ 5]*r[5], p[ 5]*r[ 6],     0,
             p[10]*r[8], p[10]*r[9], p[10]*r[10], p[11],
                  -r[8],      -r[9],      -r[10],     0
         ];
-    };
+    }
     
-    // rotated perspective matrix, vec3 (last element is inverted)
-    this.applyRotPerspToVec = function(m, v) {
+    /**
+     * Applies rotated perspective matrix to a 3-vector
+     * (last element is inverted).
+     * @private
+     * @param {number[]} m - Rotated perspective matrix.
+     * @param {number[]} v - Input 3-vector.
+     * @returns {number[]} Resulting 4-vector.
+     */
+    function applyRotPerspToVec(m, v) {
         return [
                     m[ 0]*v[0] + m[ 1]*v[1] + m[ 2]*v[2],
                     m[ 4]*v[0] + m[ 5]*v[1] + m[ 6]*v[2],
             m[11] + m[ 8]*v[0] + m[ 9]*v[1] + m[10]*v[2],
                  1/(m[12]*v[0] + m[13]*v[1] + m[14]*v[2])
         ];
-    };
+    }
     
-    this.checkInView = function(m, v) {
-        var vpp = this.applyRotPerspToVec(m, v);
+    /**
+     * Checks if a vertex is visible.
+     * @private
+     * @param {number[]} m - Rotated perspective matrix.
+     * @param {number[]} v - Input vertex.
+     * @returns {number} 1 or -1 if the vertex is or is not visible,
+     *      respectively.
+     */
+    function checkInView(m, v) {
+        var vpp = applyRotPerspToVec(m, v);
         var winX = vpp[0]*vpp[3];
         var winY = vpp[1]*vpp[3];
         var winZ = vpp[2]*vpp[3];
@@ -674,13 +1015,20 @@ function Renderer(container, image, imageType, video) {
         if ( winZ < -1 || winZ > 1 )
             ret[2] = 1;
         return ret;
-    };
+    }
     
-    this.checkSquareInView = function(m, v) {
-        var check1 = this.checkInView(m, v.slice(0, 3));
-        var check2 = this.checkInView(m, v.slice(3, 6));
-        var check3 = this.checkInView(m, v.slice(6, 9));
-        var check4 = this.checkInView(m, v.slice(9, 12));
+    /**
+     * Checks if a square (tile) is visible.
+     * @private
+     * @param {number[]} m - Rotated perspective matrix.
+     * @param {number[]} v - Square's vertex array.
+     * @returns {boolean} Whether or not the square is visible.
+     */
+    function checkSquareInView(m, v) {
+        var check1 = checkInView(m, v.slice(0, 3));
+        var check2 = checkInView(m, v.slice(3, 6));
+        var check3 = checkInView(m, v.slice(6, 9));
+        var check4 = checkInView(m, v.slice(9, 12));
         var testX = check1[0] + check2[0] + check3[0] + check4[0];
         if ( testX == -4 || testX == 4 )
             return false;
@@ -688,11 +1036,10 @@ function Renderer(container, image, imageType, video) {
         if ( testY == -4 || testY == 4 )
             return false;
         var testZ = check1[2] + check2[2] + check3[2] + check4[2];
-        if ( testZ == 4 )
-            return false;
+        return testZ != 4;
         
-        return true;
-    };
+
+    }
 }
 
 // Vertex shader for equirectangular and cube
@@ -784,6 +1131,7 @@ var fragEquirectangular = [
 'uniform float u_h;',
 'uniform float u_v;',
 'uniform float u_vo;',
+'uniform float u_rot;',
 
 'const float PI = 3.14159265358979323846264;',
 
@@ -797,12 +1145,16 @@ var fragEquirectangular = [
     // Map canvas/camera to sphere
     'float x = v_texCoord.x * u_aspectRatio;',
     'float y = v_texCoord.y;',
+    'float sinrot = sin(u_rot);',
+    'float cosrot = cos(u_rot);',
+    'float rot_x = x * cosrot - y * sinrot;',
+    'float rot_y = x * sinrot + y * cosrot;',
     'float sintheta = sin(u_theta);',
     'float costheta = cos(u_theta);',
-    'float a = u_f * costheta - y * sintheta;',
-    'float root = sqrt(x * x + a * a);',
-    'float lambda = atan(x / root, a / root) + u_psi;',
-    'float phi = atan((y * costheta + u_f * sintheta) / root);',
+    'float a = u_f * costheta - rot_y * sintheta;',
+    'float root = sqrt(rot_x * rot_x + a * a);',
+    'float lambda = atan(rot_x / root, a / root) + u_psi;',
+    'float phi = atan((rot_y * costheta + u_f * sintheta) / root);',
 
     // Wrap image
     'if(lambda > PI)',
@@ -836,8 +1188,8 @@ var fragMulti = [
 ].join('');
 
 return {
-    renderer: function(canvas, image, imagetype, video) {
-        return new Renderer(canvas, image, imagetype, video);
+    renderer: function(container, image, imagetype, dynamic) {
+        return new Renderer(container, image, imagetype, dynamic);
     }
 };
 
